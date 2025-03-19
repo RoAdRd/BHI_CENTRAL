@@ -26,21 +26,51 @@
         BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef1))
 
 
-static struct bt_conn *default_conn;
-static struct bt_gatt_subscribe_params subscribe_params;
+static struct bt_conn *connections[2] = {NULL, NULL};
+static struct bt_gatt_subscribe_params subscribe_params[2];
 static struct bt_gatt_discover_params discover_params;
 static struct bt_gatt_write_params write_params;
 static struct bt_gatt_read_params read_params;
+
+// Track states separately for connection and notification
+static bool connected_devices[2] = {false, false};
+static bool notifications_enabled[2] = {false, false};
+static int active_conn_idx = 0; // Track which device we're currently working with
+static int active_discovery_idx = -1; // Track which device we're currently discovering for
+
+// State machine phases
+typedef enum {
+    PHASE_CONNECTING,    // Connecting to both devices
+    PHASE_DISCOVERING,   // Discovering services/characteristics
+    PHASE_OPERATIONAL    // Both devices connected and notifications enabled
+} system_phase_t;
+
+static system_phase_t current_phase = PHASE_CONNECTING;
+
+// Forward declarations
+static void start_scan(void);
+static void start_discovery_phase(int idx);
+static uint8_t discover_func(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+                            struct bt_gatt_discover_params *params);
 
 static uint8_t notify_func(struct bt_conn *conn, struct bt_gatt_subscribe_params *params,
                            const void *data, uint16_t length)
 {
     if (!data) {
-		printk("[UNSUBSCRIBED] no data in the notif\n");
-		params->value_handle = 0U;
-		return BT_GATT_ITER_STOP;
-	}
-    printk("Notification received: ");
+        printk("[UNSUBSCRIBED] no data in the notif\n");
+        params->value_handle = 0U;
+        return BT_GATT_ITER_STOP;
+    }
+    
+    int conn_idx = -1;
+    for (int i = 0; i < 2; i++) {
+        if (connections[i] == conn) {
+            conn_idx = i;
+            break;
+        }
+    }
+    
+    printk("Notification received from device %d: ", conn_idx);
     for (int i = 0; i < length; i++) {
         printk("%02x ", ((uint8_t *)data)[i]);
     }
@@ -49,20 +79,25 @@ static uint8_t notify_func(struct bt_conn *conn, struct bt_gatt_subscribe_params
     return BT_GATT_ITER_CONTINUE;
 }
 
-
-static void start_scan(void);
-
 static uint8_t indicate_func(struct bt_conn *conn, struct bt_gatt_subscribe_params *params,
                              const void *data, uint16_t length) {
     if (data) {
-        printk("Indication received: ");
+        int conn_idx = -1;
+        for (int i = 0; i < 2; i++) {
+            if (connections[i] == conn) {
+                conn_idx = i;
+                break;
+            }
+        }
+        
+        printk("Indication received from device %d: ", conn_idx);
         for (uint16_t i = 0; i < length; i++) {
             printk("%02x ", ((uint8_t *)data)[i]);
         }
         printk("\n");
 
         if (length == 3 && ((uint8_t *)data)[0] == 0x20 && ((uint8_t *)data)[1] == 0x01 && ((uint8_t *)data)[2] == 0x01) {
-            printk("Expected indication response received.\n");
+            printk("Expected indication response received from device %d.\n", conn_idx);
         }
     } else {
         printk("Indication confirmation received.\n");
@@ -79,35 +114,69 @@ static void write_func(struct bt_conn *conn, uint8_t err, struct bt_gatt_write_p
     }
 }
 
-// Subscribe function
-static void subscribe_to_characteristic(struct bt_conn *conn, uint16_t value_handle) {
-    int err;
-
-    subscribe_params.notify = indicate_func;
-    subscribe_params.value_handle = value_handle;
-    subscribe_params.ccc_handle = 0; // This will be auto-discovered
-    subscribe_params.value = BT_GATT_CCC_INDICATE;
-    atomic_set_bit(subscribe_params.flags, BT_GATT_SUBSCRIBE_FLAG_VOLATILE);
-
-    err = bt_gatt_subscribe(conn, &subscribe_params);
-    if (err) {
-        printk("Subscribe failed (err %d)\n", err);
-    } else {
-        printk("Subscribed successfully\n");
-
-        static uint8_t data[] = {0x20, 0x01};
-        write_params.func = write_func;
-        write_params.handle = value_handle;
-        write_params.offset = 0;
-        write_params.data = data;
-        write_params.length = sizeof(data);
-
-        err = bt_gatt_write(conn, &write_params);
-        if (err) {
-            printk("Write request failed (err %d)\n", err);
-        } else {
-            printk("Write request sent\n");
+// Function to check if we're ready to move to the next phase
+static void check_phase_transition(void) {
+    if (current_phase == PHASE_CONNECTING && connected_devices[0] && connected_devices[1]) {
+        // Both devices connected, move to discovery phase
+        printk("Both devices connected, starting discovery phase\n");
+        current_phase = PHASE_DISCOVERING;
+        for(int i = 0; i < 2; i++) {
+            start_discovery_phase(i);
         }
+    } else if (current_phase == PHASE_DISCOVERING && notifications_enabled[0] && notifications_enabled[1]) {
+        // Both devices have notifications enabled, move to operational phase
+        printk("Notifications enabled for both devices, entering operational phase\n");
+        current_phase = PHASE_OPERATIONAL;
+    }
+}
+
+// Function to start discovery for the first device
+static void start_discovery_phase(int idx) {
+    active_discovery_idx = idx;
+    printk("Starting discovery for device %d\n", active_discovery_idx);
+    
+    discover_params.uuid = NULL;
+    discover_params.func = discover_func;
+    discover_params.start_handle = 0x0001;
+    discover_params.end_handle = 0xffff;
+    discover_params.type = BT_GATT_DISCOVER_PRIMARY;
+
+    int err = bt_gatt_discover(connections[active_discovery_idx], &discover_params);
+    if (err) {
+        printk("Discover failed for device %d (err %d)\n", active_discovery_idx, err);
+        // Try the next device
+        // active_discovery_idx = 1;
+        // err = bt_gatt_discover(connections[active_discovery_idx], &discover_params);
+        // if (err) {
+        //     printk("Discover failed for both devices\n");
+        // }
+    }
+    else {
+        notifications_enabled[active_discovery_idx] = true;
+        printk("Notifications enabled for device %d\n", active_discovery_idx);
+    }
+}
+
+// Move to the next device for discovery
+static void discover_next_device(void) {
+    if (active_discovery_idx == 0) {
+        active_discovery_idx = 1;
+        printk("Starting discovery for device %d\n", active_discovery_idx);
+        
+        discover_params.uuid = NULL;
+        discover_params.func = discover_func;
+        discover_params.start_handle = 0x0001;
+        discover_params.end_handle = 0xffff;
+        discover_params.type = BT_GATT_DISCOVER_PRIMARY;
+
+        int err = bt_gatt_discover(connections[active_discovery_idx], &discover_params);
+        if (err) {
+            printk("Discover failed for device %d (err %d)\n", active_discovery_idx, err);
+        }
+    } else {
+        // Both devices have been processed, check if we can move to operational phase
+        notifications_enabled[active_discovery_idx] = true;
+        check_phase_transition();
     }
 }
 
@@ -116,79 +185,118 @@ static uint8_t discover_func(struct bt_conn *conn,
                              struct bt_gatt_discover_params *params)
 {
     int err;
-
+    int conn_idx = active_discovery_idx;
+    char uuid_str[37]; // Buffer for UUID string
+    
     if (!attr) {
-        printk("Discovery complete\n");
+        printk("Discovery complete for device %d\n", conn_idx);
+        // Move to the next device for discovery
+        // discover_next_device();
         return BT_GATT_ITER_STOP;
     }
-
     if (params->type == BT_GATT_DISCOVER_PRIMARY) {
         struct bt_gatt_service_val *service = (struct bt_gatt_service_val *)attr->user_data;
-        printk("Service UUID: %s\n", bt_uuid_str(service->uuid));
+        bt_uuid_to_str(service->uuid, uuid_str, sizeof(uuid_str));
+        printk("Device %d - Service UUID: %s\n", conn_idx, uuid_str);
 
         if (!bt_uuid_cmp(service->uuid, BT_UUID_SHS)) {
-            printk("Service UUID matched\n");
+            printk("Device %d - Service UUID matched\n", conn_idx);
 
-            discover_params.uuid = NULL;
-            discover_params.start_handle = attr->handle + 1;
-            discover_params.end_handle = service->end_handle;
-            discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
-            discover_params.func = discover_func;
+            params->uuid = NULL;
+            params->start_handle = attr->handle + 1;
+            params->end_handle = service->end_handle;
+            params->type = BT_GATT_DISCOVER_CHARACTERISTIC;
 
-            err = bt_gatt_discover(conn, &discover_params);
+            err = bt_gatt_discover(conn, params);
             if (err) {
-                printk("Discover failed (err %d)\n", err);
+                printk("Device %d - Discover failed (err %d)\n", conn_idx, err);
+                // discover_next_device();
                 return BT_GATT_ITER_STOP;
             }
         }
     } else if (params->type == BT_GATT_DISCOVER_CHARACTERISTIC) {
         struct bt_gatt_chrc *chrc = (struct bt_gatt_chrc *)attr->user_data;
-        printk("Characteristic UUID: %s\n", bt_uuid_str(chrc->uuid));
-
+        bt_uuid_to_str(chrc->uuid, uuid_str, sizeof(uuid_str));
+        printk("Device %d - Characteristic UUID: %s\n", conn_idx, uuid_str);
 
         if (!bt_uuid_cmp(chrc->uuid, BT_UUID_SHC)) {
-            // printk("Characteristic UUID matched\n");
-			// printk("%x \n",chrc->properties);
-            // subscribe_params.notify = indicate_func;
-		    // subscribe_params.value = BT_GATT_CCC_INDICATE;
-		    // subscribe_params.ccc_handle = attr->handle+2;
-            // err = bt_gatt_subscribe(conn, &subscribe_params);
-            // if (err) {
-            //     printk("Subscribe failed (err %d)\n", err);
-            // } else {
-            //     printk("[SUBSCRIBED]\n");
-            // }
-			// static uint8_t data = 0x99;
-            // write_params.func = write_func;
-            // write_params.handle = chrc->value_handle;
-            // write_params.offset = 0;
-            // write_params.data = &data;
-            // write_params.length = sizeof(data);
-            // int err = bt_gatt_write(conn, &write_params);
-            // if (err) {
-            //     printk("Write request failed (err %d)\n", err);
-            // } else {
-            //     printk("Write request sent\n");
-            // }
-            //     return BT_GATT_ITER_STOP;
-            subscribe_params.notify = notify_func;
-            subscribe_params.value_handle = bt_gatt_attr_value_handle(attr);
-            subscribe_params.ccc_handle = attr->handle+2 ;  // Usually CCCD is located two handles after characteristic
-            subscribe_params.value = BT_GATT_CCC_NOTIFY;
-            err = bt_gatt_subscribe(conn, &subscribe_params);
-        //     err = bt_gatt_subscribe(conn, &subscribe_params);
+            subscribe_params[conn_idx].notify = notify_func;
+            subscribe_params[conn_idx].value_handle = bt_gatt_attr_value_handle(attr);
+            subscribe_params[conn_idx].ccc_handle = attr->handle+2;  // Usually CCCD is located two handles after characteristic
+            subscribe_params[conn_idx].value = BT_GATT_CCC_NOTIFY;
+            err = bt_gatt_subscribe(conn, &subscribe_params[conn_idx]);
             if (err && err != -EALREADY) {
-                printk("Subscribe failed (err %d)\n", err);
+                printk("Device %d - Subscribe failed (err %d)\n", conn_idx, err);
             } else {
-                printk("[SUBSCRIBED]\n");
+                printk("Device %d - [SUBSCRIBED]\n", conn_idx);
             }
-
+            params->type = BT_GATT_DISCOVER_PRIMARY;
+            
+            // Move to the next device
+            // discover_next_device();
             return BT_GATT_ITER_STOP;
         }
+    }
 
-		else if (params->type == BT_GATT_DISCOVER_ATTRIBUTE) {
-			printk("Found\n");
-		}
+    return BT_GATT_ITER_CONTINUE;
+}
+
+static uint8_t discover_func_1(struct bt_conn *conn,
+                             const struct bt_gatt_attr *attr,
+                             struct bt_gatt_discover_params *params)
+{
+    int err;
+    int conn_idx = active_discovery_idx;
+    char uuid_str[37]; // Buffer for UUID string
+    
+    if (!attr) {
+        printk("Discovery complete for device %d\n", conn_idx);
+        // Move to the next device for discovery
+        // discover_next_device();
+        return BT_GATT_ITER_STOP;
+    }
+
+    if (params->type == BT_GATT_DISCOVER_PRIMARY) {
+        struct bt_gatt_service_val *service = (struct bt_gatt_service_val *)attr->user_data;
+        bt_uuid_to_str(service->uuid, uuid_str, sizeof(uuid_str));
+        printk("Device %d - Service UUID: %s\n", conn_idx, uuid_str);
+
+        if (!bt_uuid_cmp(service->uuid, BT_UUID_SHS)) {
+            printk("Device %d - Service UUID matched\n", conn_idx);
+
+            params->uuid = NULL;
+            params->start_handle = attr->handle + 1;
+            params->end_handle = service->end_handle;
+            params->type = BT_GATT_DISCOVER_CHARACTERISTIC;
+
+            err = bt_gatt_discover(conn, params);
+            if (err) {
+                printk("Device %d - Discover failed (err %d)\n", conn_idx, err);
+                // discover_next_device();
+                return BT_GATT_ITER_STOP;
+            }
+        }
+    } else if (params->type == BT_GATT_DISCOVER_CHARACTERISTIC) {
+        struct bt_gatt_chrc *chrc = (struct bt_gatt_chrc *)attr->user_data;
+        bt_uuid_to_str(chrc->uuid, uuid_str, sizeof(uuid_str));
+        printk("Device %d - Characteristic UUID: %s\n", conn_idx, uuid_str);
+
+        if (!bt_uuid_cmp(chrc->uuid, BT_UUID_SHC)) {
+            subscribe_params[conn_idx].notify = notify_func;
+            subscribe_params[conn_idx].value_handle = bt_gatt_attr_value_handle(attr);
+            subscribe_params[conn_idx].ccc_handle = attr->handle+2;  // Usually CCCD is located two handles after characteristic
+            subscribe_params[conn_idx].value = BT_GATT_CCC_NOTIFY;
+            err = bt_gatt_subscribe(conn, &subscribe_params[conn_idx]);
+            if (err && err != -EALREADY) {
+                printk("Device %d - Subscribe failed (err %d)\n", conn_idx, err);
+            } else {
+                printk("Device %d - [SUBSCRIBED]\n", conn_idx);
+            }
+            
+            // Move to the next device
+            // discover_next_device();
+            return BT_GATT_ITER_STOP;
+        }
     }
 
     return BT_GATT_ITER_CONTINUE;
@@ -198,34 +306,65 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
 {
     if (conn_err) {
         printk("Failed to connect (err %d)\n", conn_err);
+        
+        // Try the other device if we're in connecting phase
+        if (current_phase == PHASE_CONNECTING) {
+            if (active_conn_idx == 0) {
+                // Failed to connect to device 0, try device 1
+                active_conn_idx = 1;
+                start_scan();
+            } else {
+                // Failed to connect to device 1, try device 0 again
+                active_conn_idx = 0;
+                start_scan();
+            }
+        }
         return;
     }
 
-    default_conn = bt_conn_ref(conn);
-
-    printk("Connected\n");
-//     bt_set_bondable(true);
-
-
-    discover_params.uuid = NULL;
-    discover_params.func = discover_func;
-    discover_params.start_handle = 0x0001;
-    discover_params.end_handle = 0xffff;
-    discover_params.type = BT_GATT_DISCOVER_PRIMARY;
-
-    int err = bt_gatt_discover(default_conn, &discover_params);
-    if (err) {
-        printk("Discover failed(err %d)\n", err);
+    char addr_str[BT_ADDR_LE_STR_LEN];
+    bt_addr_le_to_str(bt_conn_get_dst(conn), addr_str, sizeof(addr_str));
+    printk("Connected to %s\n", addr_str);
+    
+    // Store the connection in the current active slot
+    connections[active_conn_idx] = bt_conn_ref(conn);
+    connected_devices[active_conn_idx] = true;
+    printk("Saved as connection %d\n", active_conn_idx);
+    
+    if (current_phase == PHASE_CONNECTING) {
+        // If we've connected to device 0, start connecting to device 1
+        if (active_conn_idx == 0 && !connected_devices[1]) {
+            active_conn_idx = 1;
+            start_scan();
+        } 
+        // If both devices are connected, check for phase transition
+        else {
+            check_phase_transition();
+        }
     }
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
-    printk("Disconnected (reason %d)\n", reason);
+    char addr_str[BT_ADDR_LE_STR_LEN];
+    bt_addr_le_to_str(bt_conn_get_dst(conn), addr_str, sizeof(addr_str));
+    printk("Disconnected from %s (reason %d)\n", addr_str, reason);
 
-    if (default_conn) {
-        bt_conn_unref(default_conn);
-        default_conn = NULL;
+    // Find which connection was disconnected
+    for (int i = 0; i < 2; i++) {
+        if (connections[i] == conn) {
+            bt_conn_unref(connections[i]);
+            connections[i] = NULL;
+            connected_devices[i] = false;
+            notifications_enabled[i] = false;
+            printk("Connection %d removed\n", i);
+            
+            // Reset to connecting phase if any device disconnects
+            current_phase = PHASE_CONNECTING;
+            active_conn_idx = i;  // Try to reconnect to the same device
+            start_scan();
+            break;
+        }
     }
 }
 
@@ -237,15 +376,23 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
 static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
                          struct net_buf_simple *ad)
 {
- uint8_t target_mac[6];
-        target_mac[0] = 237;
-        target_mac[1] = 10;
-        target_mac[2] = 57;
-        target_mac[3] = 240;
-        target_mac[4] = 14;
-        target_mac[5] = 28;
+    uint8_t target_mac[6];
+    target_mac[0] = 237;
+    target_mac[1] = 10;
+    target_mac[2] = 57;
+    target_mac[3] = 240;
+    target_mac[4] = 14;
+    target_mac[5] = 28;
 
-     char addr_str[BT_ADDR_LE_STR_LEN];
+    uint8_t target_mac_1[6];
+    target_mac_1[0] = 195;
+    target_mac_1[1] = 165;
+    target_mac_1[2] = 216;
+    target_mac_1[3] = 38;
+    target_mac_1[4] = 247;
+    target_mac_1[5] = 197;
+
+    char addr_str[BT_ADDR_LE_STR_LEN];
     uint8_t a[6];
     bt_addr_to_str(&addr->a, addr_str, sizeof(addr_str));
  
@@ -253,41 +400,78 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
         a[i] = addr->a.val[i];
     }
 
-    if (default_conn) {
-        return;
-    }
-
-    bool err_fg = false;
-    for (int i = 0; i < BT_ADDR_SIZE; i++) {
-        if (a[i] != target_mac[BT_ADDR_SIZE - i - 1]) {
-            err_fg = true;
-            break;
+    // Check if this is the device we're currently looking for
+    bool is_target = false;
+    
+    if (active_conn_idx == 0) {
+        bool matches = true;
+        for (int i = 0; i < BT_ADDR_SIZE; i++) {
+            if (a[i] != target_mac[BT_ADDR_SIZE - i - 1]) {
+                matches = false;
+                break;
+            }
         }
+        is_target = matches;
+    } else {
+        bool matches = true;
+        for (int i = 0; i < BT_ADDR_SIZE; i++) {
+            if (a[i] != target_mac_1[BT_ADDR_SIZE - i - 1]) {
+                matches = false;
+                break;
+            }
+        }
+        is_target = matches;
     }
-
-    if (err_fg) {
-        printk("DEVICE NOT FOUND\n");
+    
+    if (!is_target || connected_devices[active_conn_idx]) {
         return;
     }
-    printk("Device found: %s (RSSI %d)\n", addr_str, rssi);
+
+    printk("Target device %d found: %s (RSSI %d)\n", active_conn_idx, addr_str, rssi);
 
     int err = bt_le_scan_stop();
     if (err) {
         printk("Stop LE scan failed (err %d)\n", err);
     }
 
+    // Clean up any stale connection handles
+    if (connections[active_conn_idx] != NULL) {
+        printk("Cleaning up stale connection handle for device %d\n", active_conn_idx);
+        bt_conn_unref(connections[active_conn_idx]);
+        connections[active_conn_idx] = NULL;
+    }
+
+    // Try to connect
+    struct bt_conn *conn = NULL;
     err = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN,
-                            BT_LE_CONN_PARAM_DEFAULT, &default_conn);
+                            BT_LE_CONN_PARAM_DEFAULT, &conn);
     if (err) {
         printk("Create conn to %s failed (%u)\n", addr_str, err);
+        
+        // Try the other device if both aren't connected
+        if (active_conn_idx == 0 && !connected_devices[1]) {
+            active_conn_idx = 1;
+        } else if (active_conn_idx == 1 && !connected_devices[0]) {
+            active_conn_idx = 0;
+        }
+        
         start_scan();
+    } else if (conn) {
+        // Connection initiated
+        bt_conn_unref(conn);
     }
 }
 
 static void start_scan(void)
 {
+    // Skip scanning if in wrong phase
+    if (current_phase != PHASE_CONNECTING) {
+        return;
+    }
+    
     int err;
-
+    // bt_le_scan_stop(); // Stop any active scan
+    
     struct bt_le_scan_param scan_param = {
         .type = BT_LE_SCAN_TYPE_ACTIVE,
         .options = BT_LE_SCAN_OPT_NONE,
@@ -301,7 +485,7 @@ static void start_scan(void)
         return;
     }
 
-    printk("Scanning successfully started\n");
+    printk("Scanning for device %d started\n", active_conn_idx);
 }
 
 void main(void)
@@ -316,5 +500,8 @@ void main(void)
 
     printk("Bluetooth initialized\n");
 
+    // Initialize phase to connecting
+    current_phase = PHASE_CONNECTING;
+    active_conn_idx = 0;
     start_scan();
 }
