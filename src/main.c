@@ -62,6 +62,39 @@ static void start_discovery_phase(int idx);
 static uint8_t discover_func(struct bt_conn *conn, const struct bt_gatt_attr *attr,
                             struct bt_gatt_discover_params *params);
 
+struct agg_data_item {
+    void *fifo_reserved; /* 1st word reserved for use by kernel FIFO */
+    char data[256];
+    size_t len;
+};
+
+/* Define global FIFO for aggregated data and worker thread objects */
+static struct k_fifo agg_fifo;
+#define PHONE_NOTIFY_STACK_SIZE 1024
+#define PHONE_NOTIFY_PRIORITY 5
+K_THREAD_STACK_DEFINE(phone_notify_stack, PHONE_NOTIFY_STACK_SIZE);
+static struct k_thread phone_notify_thread;
+
+/* Create a dedicated worker that waits on the FIFO and sends notifications to the phone */
+static void phone_notify_worker(void *arg1, void *arg2, void *arg3)
+{
+    while (1) {
+        struct agg_data_item *item = k_fifo_get(&agg_fifo, K_FOREVER);
+        if (phone_conn) {
+            /* Use the characteristic handle from the service definition.
+             * (Here we continue to use "agg_svc.attrs + 2" as before.) */
+            int ret = bt_gatt_notify(phone_conn, agg_svc.attrs + 2, item->data, item->len);
+            if (ret) {
+                printk("Failed to notify phone (err %d)\n", ret);
+            }
+        } else {
+            printk("Phone not connected, dropping FIFO item\n");
+        }
+        k_free(item);
+    }
+}
+
+/* Modify the peripheral's notify callback to store data into the FIFO */
 static uint8_t notify_func(struct bt_conn *conn, struct bt_gatt_subscribe_params *params,
                            const void *data, uint16_t length)
 {
@@ -79,26 +112,31 @@ static uint8_t notify_func(struct bt_conn *conn, struct bt_gatt_subscribe_params
         }
     }
     
-    printk("Notification received from device %d: ", conn_idx);
+    printk("Peripheral notification received from device %d: ", conn_idx);
     for (int i = 0; i < length; i++) {
         printk("%02x ", ((uint8_t *)data)[i]);
     }
     printk("\n");
 
-    // Convert received data to a hex string and update agg_value:
-    {
-        int offset = snprintf(agg_value, sizeof(agg_value), "Device %d: ", conn_idx);
-        for (int i = 0; i < length && offset < sizeof(agg_value) - 3; i++) {
-            offset += snprintf(agg_value + offset, sizeof(agg_value) - offset, "%02x ", ((uint8_t *)data)[i]);
-        }
-        // If a phone is connected as a peripheral, send this updated data via notification:
-        if (phone_conn) {
-            int notify_err = bt_gatt_notify(phone_conn, agg_svc.attrs + 2, agg_value, strlen(agg_value));
-            if (notify_err) {
-                printk("Failed to notify phone (err %d)\n", notify_err);
-            }
-        }
+    /* Convert the raw data into a hex string.
+     * Here we build a temporary string that includes an identifier of the peripheral.
+     */
+    char temp_buffer[256];
+    int offset = snprintf(temp_buffer, sizeof(temp_buffer), "Device %d: ", conn_idx);
+    for (int i = 0; i < length && offset < sizeof(temp_buffer) - 3; i++) {
+        offset += snprintf(temp_buffer + offset, sizeof(temp_buffer) - offset, "%02x ", ((uint8_t *)data)[i]);
     }
+
+    /* Allocate a FIFO item and copy the resulting string */
+    struct agg_data_item *item = k_malloc(sizeof(struct agg_data_item));
+    if (!item) {
+        printk("Failed to allocate FIFO item\n");
+        return BT_GATT_ITER_CONTINUE;
+    }
+    strncpy(item->data, temp_buffer, sizeof(item->data));
+    item->data[sizeof(item->data) - 1] = '\0';
+    item->len = strlen(item->data);
+    k_fifo_put(&agg_fifo, item);
 
     return BT_GATT_ITER_CONTINUE;
 }
@@ -564,6 +602,14 @@ void main(void)
     }
 
     printk("Bluetooth initialized\n");
+
+    /* Initialize the aggregator FIFO */
+    k_fifo_init(&agg_fifo);
+
+    /* Start the phone notification worker thread */
+    k_thread_create(&phone_notify_thread, phone_notify_stack, PHONE_NOTIFY_STACK_SIZE,
+                      phone_notify_worker, NULL, NULL, NULL,
+                      PHONE_NOTIFY_PRIORITY, 0, K_NO_WAIT);
 
     // Start advertising so that a phone can connect to our GATT server:
     const struct bt_data ad[] = {
