@@ -25,6 +25,10 @@
 #define BT_UUID_SHC BT_UUID_DECLARE_128(                           \
         BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x56789abcdef1))
 
+#define BT_UUID_AGG_SERVICE BT_UUID_DECLARE_128( \
+    BT_UUID_128_ENCODE(0xabcdef01, 0x2345, 0x6789, 0x0123, 0x456789abcdef))
+#define BT_UUID_AGG_CHAR    BT_UUID_DECLARE_128( \
+    BT_UUID_128_ENCODE(0xabcdef02, 0x2345, 0x6789, 0x0123, 0x456789abcdef))
 
 static struct bt_conn *connections[2] = {NULL, NULL};
 static struct bt_gatt_subscribe_params subscribe_params[2];
@@ -47,7 +51,12 @@ typedef enum {
 
 static system_phase_t current_phase = PHASE_CONNECTING;
 
+// Global variable to track the phone connection and aggregate value:
+static struct bt_conn *phone_conn = NULL;
+static char agg_value[256] = "No Data";
+
 // Forward declarations
+extern const struct bt_gatt_service_static agg_svc;
 static void start_scan(void);
 static void start_discovery_phase(int idx);
 static uint8_t discover_func(struct bt_conn *conn, const struct bt_gatt_attr *attr,
@@ -75,6 +84,21 @@ static uint8_t notify_func(struct bt_conn *conn, struct bt_gatt_subscribe_params
         printk("%02x ", ((uint8_t *)data)[i]);
     }
     printk("\n");
+
+    // Convert received data to a hex string and update agg_value:
+    {
+        int offset = snprintf(agg_value, sizeof(agg_value), "Device %d: ", conn_idx);
+        for (int i = 0; i < length && offset < sizeof(agg_value) - 3; i++) {
+            offset += snprintf(agg_value + offset, sizeof(agg_value) - offset, "%02x ", ((uint8_t *)data)[i]);
+        }
+        // If a phone is connected as a peripheral, send this updated data via notification:
+        if (phone_conn) {
+            int notify_err = bt_gatt_notify(phone_conn, agg_svc.attrs + 2, agg_value, strlen(agg_value));
+            if (notify_err) {
+                printk("Failed to notify phone (err %d)\n", notify_err);
+            }
+        }
+    }
 
     return BT_GATT_ITER_CONTINUE;
 }
@@ -326,7 +350,15 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr_str, sizeof(addr_str));
     printk("Connected to %s\n", addr_str);
     
-    // Store the connection in the current active slot
+    // Check the role to differentiate a phone (incoming peripheral connection)
+    struct bt_conn_info info;
+    if (bt_conn_get_info(conn, &info) == 0 && info.role == BT_CONN_ROLE_PERIPHERAL) {
+        phone_conn = bt_conn_ref(conn);
+        printk("Phone connected: %s\n", addr_str);
+        return;
+    }
+
+    // For central-initiated connections (to your two devices):
     connections[active_conn_idx] = bt_conn_ref(conn);
     connected_devices[active_conn_idx] = true;
     printk("Saved as connection %d\n", active_conn_idx);
@@ -349,6 +381,14 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
     char addr_str[BT_ADDR_LE_STR_LEN];
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr_str, sizeof(addr_str));
     printk("Disconnected from %s (reason %d)\n", addr_str, reason);
+
+    // If this is the phone connection, clear it:
+    if (conn == phone_conn) {
+        bt_conn_unref(phone_conn);
+        phone_conn = NULL;
+        printk("Phone disconnected\n");
+        return;
+    }
 
     // Find which connection was disconnected
     for (int i = 0; i < 2; i++) {
@@ -488,6 +528,31 @@ static void start_scan(void)
     printk("Scanning for device %d started\n", active_conn_idx);
 }
 
+// Define a read callback for the aggregated characteristic:
+static ssize_t read_agg(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+    void *buf, uint16_t len, uint16_t offset)
+{
+    const char *value = attr->user_data;
+    return bt_gatt_attr_read(conn, attr, buf, len, offset, value, strlen(value));
+}
+
+// Define a CCC configuration changed callback:
+static void agg_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
+{
+    printk("Aggregated characteristic CCC changed: 0x%04x\n", value);
+}
+
+// Define the aggregated service using the service definition macro:
+BT_GATT_SERVICE_DEFINE(agg_svc,
+    BT_GATT_PRIMARY_SERVICE(BT_UUID_AGG_SERVICE),
+    BT_GATT_CHARACTERISTIC(BT_UUID_AGG_CHAR,
+                           BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
+                           BT_GATT_PERM_READ,
+                           read_agg, NULL, agg_value),
+    BT_GATT_CCC(agg_ccc_cfg_changed,
+                BT_GATT_PERM_READ | BT_GATT_PERM_WRITE)
+);
+
 void main(void)
 {
     int err;
@@ -499,6 +564,18 @@ void main(void)
     }
 
     printk("Bluetooth initialized\n");
+
+    // Start advertising so that a phone can connect to our GATT server:
+    const struct bt_data ad[] = {
+        BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+        BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME, (sizeof(CONFIG_BT_DEVICE_NAME) - 1)),
+    };
+    err = bt_le_adv_start(BT_LE_ADV_CONN, ad, ARRAY_SIZE(ad), NULL, 0);
+    if (err) {
+        printk("Advertising failed to start (err %d)\n", err);
+    } else {
+        printk("Advertising started\n");
+    }
 
     // Initialize phase to connecting
     current_phase = PHASE_CONNECTING;
